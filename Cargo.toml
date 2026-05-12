@@ -1,0 +1,20 @@
+[package]
+name = "discord-voice-engine"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Shared native audio-to-Opus RTP engine for Discord voice clients"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+hound = "3.5"
+opus = "0.3.1"
+rubato = "2.0.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+symphonia = { version = "0.5", features = ["all"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
