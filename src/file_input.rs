@@ -64,7 +64,8 @@ pub fn load_audio_file(path: &Path, output_channels: u8) -> Result<PcmAudio> {
             Ok(decoded) => decoded,
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(error) => {
-                return Err(error).with_context(|| format!("decode packet from {}", path.display()));
+                return Err(error)
+                    .with_context(|| format!("decode packet from {}", path.display()));
             }
         };
         let spec = *decoded.spec();

@@ -2,10 +2,13 @@ use std::io::{self, Read, Write};
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 use crate::audio::{interleaved_i16_to_mono, write_wav_i16};
 use crate::encode::{configure_encoder, encode_i16_frame};
@@ -73,6 +76,9 @@ pub fn capture_mic_to_rtp(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("parec stdout was not piped"))?;
+    let mut child_stderr = child.stderr.take();
+    let child = Arc::new(Mutex::new(child));
+    install_child_signal_handler(&child).context("install capture child signal handler")?;
 
     let socket = UdpSocket::bind(("127.0.0.1", 0)).context("bind local RTP sender")?;
     let mut addrs = options
@@ -141,9 +147,9 @@ pub fn capture_mic_to_rtp(
         timestamp = timestamp.wrapping_add(RTP_CLOCK_INCREMENT);
     };
 
-    terminate_child(&mut child);
+    terminate_child(&child);
     let mut stderr = String::new();
-    if let Some(mut child_stderr) = child.stderr.take() {
+    if let Some(mut child_stderr) = child_stderr.take() {
         let _ = child_stderr.read_to_string(&mut stderr);
     }
     result.with_context(|| {
@@ -200,7 +206,22 @@ fn write_meter_pcm<W: Write>(writer: &mut W, pcm: &[i16], channels: u8) -> Resul
     }
 }
 
-fn terminate_child(child: &mut Child) {
+fn install_child_signal_handler(child: &Arc<Mutex<Child>>) -> Result<()> {
+    let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])?;
+    let child = Arc::clone(child);
+    std::thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            terminate_child(&child);
+            std::process::exit(128 + signal);
+        }
+    });
+    Ok(())
+}
+
+fn terminate_child(child: &Arc<Mutex<Child>>) {
+    let Ok(mut child) = child.lock() else {
+        return;
+    };
     match child.try_wait() {
         Ok(Some(_)) => return,
         Ok(None) | Err(_) => {}
