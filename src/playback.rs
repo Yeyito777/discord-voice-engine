@@ -499,7 +499,7 @@ impl ChildPcmSink {
                 "--channels",
                 &channels.to_string(),
                 "--format",
-                "s16le",
+                "s16",
                 "--latency",
                 "50ms",
                 "-",
