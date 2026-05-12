@@ -150,7 +150,20 @@ struct DecodeTraceStats {
     first_timestamp: Option<u32>,
     last_timestamp: Option<u32>,
     output_duration_ms: u64,
+    gaps: Vec<DecodeTraceGap>,
+    gaps_truncated: bool,
 }
+
+#[derive(Debug, Serialize)]
+struct DecodeTraceGap {
+    previous_sequence: u16,
+    sequence: u16,
+    missing_packets: usize,
+    offset_ms: u64,
+    missing_duration_ms: u64,
+}
+
+const MAX_REPORTED_TRACE_GAPS: usize = 100;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -304,6 +317,8 @@ fn decode_trace_command(
     let mut last_sequence = None;
     let mut first_timestamp = None;
     let mut last_timestamp = None;
+    let mut gaps = Vec::new();
+    let mut gaps_truncated = false;
 
     for (line_number, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -334,6 +349,17 @@ fn decode_trace_command(
                 sequence_gap_events += 1;
                 concealed_lost_packets += missing;
                 max_consecutive_lost_packets = max_consecutive_lost_packets.max(missing);
+                if gaps.len() < MAX_REPORTED_TRACE_GAPS {
+                    gaps.push(DecodeTraceGap {
+                        previous_sequence,
+                        sequence: frame.sequence,
+                        missing_packets: missing,
+                        offset_ms: decoded_packets as u64 * 20,
+                        missing_duration_ms: missing as u64 * 20,
+                    });
+                } else {
+                    gaps_truncated = true;
+                }
                 for _ in 0..missing {
                     decode_one_trace_packet(
                         &mut decoder,
@@ -387,6 +413,8 @@ fn decode_trace_command(
         first_timestamp,
         last_timestamp,
         output_duration_ms,
+        gaps,
+        gaps_truncated,
     };
     if let Some(path) = stats_json.as_deref() {
         std::fs::write(path, serde_json::to_vec_pretty(&stats)?)
