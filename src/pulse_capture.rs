@@ -105,10 +105,10 @@ pub fn capture_mic_to_rtp(
     let started = Instant::now();
     let debug_capture = std::env::var_os("DVE_CAPTURE_DEBUG").is_some();
     let result = loop {
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
-                break Ok(());
-            }
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            break Ok(());
         }
         if let Err(error) = capture_stdout.read_exact(&mut bytes) {
             break Err(error).context("read PCM from parec");
@@ -222,9 +222,8 @@ fn terminate_child(child: &Arc<Mutex<Child>>) {
     let Ok(mut child) = child.lock() else {
         return;
     };
-    match child.try_wait() {
-        Ok(Some(_)) => return,
-        Ok(None) | Err(_) => {}
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
     }
     let _ = child.kill();
     let _ = child.wait();

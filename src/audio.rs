@@ -41,7 +41,7 @@ pub fn convert_channels(
     if !(1..=2).contains(&output_channels) {
         bail!("unsupported output channel count: {output_channels}");
     }
-    if input.len() % input_channels != 0 {
+    if !input.len().is_multiple_of(input_channels) {
         bail!("input sample count is not divisible by channel count");
     }
     if input_channels == output_channels {

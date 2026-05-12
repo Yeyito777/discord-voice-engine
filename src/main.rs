@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use opus::{Channels, Decoder};
@@ -11,6 +11,10 @@ use discord_voice_engine::audio::{
 };
 use discord_voice_engine::encode::{decode_frames_to_wav, encode_float_frames};
 use discord_voice_engine::file_input::load_audio_file;
+use discord_voice_engine::playback::{
+    PlaybackOptions, PlaybackOutput, PlaybackRecoveryStats, RtpAudioPacket, play_rtp,
+    recover_ordered_packets_to_pcm,
+};
 use discord_voice_engine::pulse_capture::{CaptureOptions, capture_mic_to_rtp};
 use discord_voice_engine::rtp::{frame_payloads_to_rtp, send_rtp_frames};
 use discord_voice_engine::{
@@ -90,12 +94,70 @@ enum Command {
         #[arg(long)]
         stats_json: Option<PathBuf>,
     },
+    /// Receive plain Opus RTP, run jitter-buffered Opus PLC recovery, and play decoded PCM.
+    PlayRtp {
+        #[arg(long)]
+        rtp: String,
+        #[arg(long, default_value_t = 2)]
+        channels: u8,
+        #[arg(long, default_value_t = DEFAULT_PAYLOAD_TYPE)]
+        payload_type: u8,
+        #[arg(long, default_value_t = 240)]
+        jitter_ms: u64,
+        #[arg(long, default_value_t = 350)]
+        idle_timeout_ms: u64,
+        #[arg(long, default_value_t = 10)]
+        max_plc_packets: usize,
+        #[arg(long, value_enum, default_value_t = PlaybackOutputArg::Pipewire)]
+        output: PlaybackOutputArg,
+        #[arg(long)]
+        output_wav: Option<PathBuf>,
+        #[arg(long)]
+        duration_ms: Option<u64>,
+        #[arg(long)]
+        stats_json: Option<PathBuf>,
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
+        #[arg(long)]
+        fec: bool,
+    },
+    /// Deterministically inject Opus RTP packet loss and verify decoder-state PLC recovery.
+    TestPlaybackRecovery {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        iterations: usize,
+        #[arg(long, default_value_t = 20)]
+        loss_per_mille: u32,
+        #[arg(long, default_value_t = 3)]
+        max_burst: usize,
+        #[arg(long, default_value_t = 0x5eed_u64)]
+        seed: u64,
+        #[arg(long, default_value_t = 2)]
+        channels: u8,
+        #[arg(long)]
+        bitrate: Option<i32>,
+        #[arg(long, default_value_t = DEFAULT_PAYLOAD_TYPE)]
+        payload_type: u8,
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        #[arg(long)]
+        stats_json: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ModeArg {
     Voice,
     Music,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PlaybackOutputArg {
+    Pipewire,
+    Pulse,
+    Null,
+    Wav,
 }
 
 impl From<ModeArg> for AudioMode {
@@ -165,6 +227,47 @@ struct DecodeTraceGap {
 
 const MAX_REPORTED_TRACE_GAPS: usize = 100;
 
+#[derive(Debug, Serialize)]
+struct PlaybackRecoveryHarnessSummary {
+    mode: &'static str,
+    input: String,
+    iterations: usize,
+    loss_per_mille: u32,
+    max_burst: usize,
+    seed: u64,
+    channels: u8,
+    payload_type: u8,
+    encoded_packets: usize,
+    total_dropped_packets: usize,
+    total_concealed_packets: usize,
+    total_decode_errors: usize,
+    max_consecutive_missing_packets: usize,
+    min_loss_window_relative_rms: f64,
+    min_concealed_rms: f64,
+    iterations_with_loss: usize,
+    failures: Vec<String>,
+    iteration_stats: Vec<PlaybackRecoveryHarnessIteration>,
+}
+
+#[derive(Debug, Serialize)]
+struct PlaybackRecoveryHarnessIteration {
+    iteration: usize,
+    seed: u64,
+    dropped_packets: usize,
+    dropped_ranges: Vec<PacketRange>,
+    loss_window_relative_rms: f64,
+    concealed_rms: f64,
+    output_duration_ms: u64,
+    stats: PlaybackRecoveryStats,
+    output_wav: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PacketRange {
+    start: usize,
+    end: usize,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -228,12 +331,66 @@ fn main() -> Result<()> {
         } => {
             decode_trace_command(&input, &output, channels, stats_json)?;
         }
+        Command::PlayRtp {
+            rtp,
+            channels,
+            payload_type,
+            jitter_ms,
+            idle_timeout_ms,
+            max_plc_packets,
+            output,
+            output_wav,
+            duration_ms,
+            stats_json,
+            ready_file,
+            fec,
+        } => {
+            let output = playback_output_from_args(output, output_wav.as_deref())?;
+            play_rtp(PlaybackOptions {
+                rtp_addr: &rtp,
+                channels,
+                payload_type,
+                jitter_ms,
+                idle_timeout_ms,
+                max_plc_packets,
+                output,
+                duration_ms,
+                stats_json: stats_json.as_deref(),
+                ready_file: ready_file.as_deref(),
+                use_fec: fec,
+            })?;
+        }
+        Command::TestPlaybackRecovery {
+            input,
+            iterations,
+            loss_per_mille,
+            max_burst,
+            seed,
+            channels,
+            bitrate,
+            payload_type,
+            output_dir,
+            stats_json,
+        } => {
+            test_playback_recovery_command(
+                &input,
+                iterations,
+                loss_per_mille,
+                max_burst,
+                seed,
+                channels,
+                bitrate,
+                payload_type,
+                output_dir.as_deref(),
+                stats_json,
+            )?;
+        }
     }
     Ok(())
 }
 
 fn encode_file_command(
-    input: &PathBuf,
+    input: &Path,
     rtp: Option<&str>,
     config: EngineConfig,
     realtime: bool,
@@ -295,8 +452,8 @@ fn encode_file_command(
 }
 
 fn decode_trace_command(
-    input: &PathBuf,
-    output: &PathBuf,
+    input: &Path,
+    output: &Path,
     channels: u8,
     stats_json: Option<PathBuf>,
 ) -> Result<DecodeTraceStats> {
@@ -425,6 +582,316 @@ fn decode_trace_command(
         received_packets, concealed_lost_packets, sequence_gap_events,
     );
     Ok(stats)
+}
+
+fn playback_output_from_args<'a>(
+    output: PlaybackOutputArg,
+    output_wav: Option<&'a std::path::Path>,
+) -> Result<PlaybackOutput<'a>> {
+    Ok(match output {
+        PlaybackOutputArg::Pipewire => PlaybackOutput::PipeWire,
+        PlaybackOutputArg::Pulse => PlaybackOutput::Pulse,
+        PlaybackOutputArg::Null => PlaybackOutput::Null,
+        PlaybackOutputArg::Wav => {
+            let Some(path) = output_wav else {
+                bail!("--output wav requires --output-wav");
+            };
+            PlaybackOutput::Wav(path)
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn test_playback_recovery_command(
+    input: &Path,
+    iterations: usize,
+    loss_per_mille: u32,
+    max_burst: usize,
+    seed: u64,
+    channels: u8,
+    bitrate: Option<i32>,
+    payload_type: u8,
+    output_dir: Option<&std::path::Path>,
+    stats_json: Option<PathBuf>,
+) -> Result<PlaybackRecoveryHarnessSummary> {
+    let channels = channels.clamp(1, 2);
+    let config = EngineConfig::new(AudioMode::Music, channels, bitrate, payload_type, 1);
+    let mut audio = load_audio_file(input, channels)
+        .with_context(|| format!("load playback recovery input {}", input.display()))?;
+    pad_to_full_opus_frames(&mut audio.samples, audio.channels);
+    let payloads = encode_float_frames(&audio.samples, &config)?;
+    let frames = frame_payloads_to_rtp(payloads);
+    let packets: Vec<RtpAudioPacket> = frames
+        .iter()
+        .map(|frame| RtpAudioPacket {
+            sequence: frame.sequence,
+            timestamp: frame.timestamp,
+            ssrc: config.ssrc,
+            payload_type: config.payload_type,
+            payload: frame.payload.clone(),
+        })
+        .collect();
+    let (reference_pcm, reference_stats) =
+        recover_ordered_packets_to_pcm(&packets, channels, payload_type, false)?;
+    if reference_stats.decode_errors != 0 {
+        bail!(
+            "reference no-loss decode had {} decode error(s)",
+            reference_stats.decode_errors
+        );
+    }
+    if let Some(dir) = output_dir {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create playback recovery output dir {}", dir.display()))?;
+        write_wav_i16(
+            &dir.join("reference.wav"),
+            &reference_pcm,
+            channels,
+            SAMPLE_RATE,
+        )
+        .with_context(|| format!("write playback recovery reference WAV in {}", dir.display()))?;
+    }
+
+    let mut total_dropped_packets = 0usize;
+    let mut total_concealed_packets = 0usize;
+    let mut total_decode_errors = 0usize;
+    let mut max_consecutive_missing_packets = 0usize;
+    let mut min_loss_window_relative_rms = f64::INFINITY;
+    let mut min_concealed_rms = f64::INFINITY;
+    let mut iterations_with_loss = 0usize;
+    let mut failures = Vec::new();
+    let mut iteration_stats = Vec::new();
+
+    for iteration in 0..iterations {
+        let iteration_seed =
+            seed.wrapping_add((iteration as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let dropped = choose_loss_indices(packets.len(), loss_per_mille, max_burst, iteration_seed);
+        let survivors: Vec<_> = packets
+            .iter()
+            .enumerate()
+            .filter(|(index, _packet)| !dropped[*index])
+            .map(|(_index, packet)| packet.clone())
+            .collect();
+        let dropped_count = dropped.iter().filter(|value| **value).count();
+        if dropped_count > 0 {
+            iterations_with_loss += 1;
+        }
+        let (recovered_pcm, stats) =
+            recover_ordered_packets_to_pcm(&survivors, channels, payload_type, false)?;
+        let dropped_ranges = packet_ranges(&dropped);
+        let expected_missing = dropped_count;
+        if stats.missing_packets != expected_missing {
+            failures.push(format!(
+                "iteration {iteration}: expected {expected_missing} missing packet(s), recovery reported {}",
+                stats.missing_packets
+            ));
+        }
+        if stats.concealed_packets != expected_missing {
+            failures.push(format!(
+                "iteration {iteration}: expected {expected_missing} concealed packet(s), recovery reported {}",
+                stats.concealed_packets
+            ));
+        }
+        if recovered_pcm.len() != reference_pcm.len() {
+            failures.push(format!(
+                "iteration {iteration}: recovered PCM length {} != no-loss length {}",
+                recovered_pcm.len(),
+                reference_pcm.len()
+            ));
+        }
+        if stats.decode_errors != 0 {
+            failures.push(format!(
+                "iteration {iteration}: {} Opus decode error(s)",
+                stats.decode_errors
+            ));
+        }
+        let concealed_rms = dropped_window_rms(&recovered_pcm, &dropped, channels);
+        let reference_loss_rms = dropped_window_rms(&reference_pcm, &dropped, channels);
+        let loss_window_relative_rms = if reference_loss_rms <= f64::EPSILON {
+            1.0
+        } else {
+            concealed_rms / reference_loss_rms
+        };
+        if dropped_count > 0 {
+            min_concealed_rms = min_concealed_rms.min(concealed_rms);
+            min_loss_window_relative_rms =
+                min_loss_window_relative_rms.min(loss_window_relative_rms);
+            // This is intentionally conservative. It catches hard-silence insertion, while still
+            // allowing Opus PLC to decay during long/bursty gaps.
+            if reference_loss_rms > 0.02 && concealed_rms < 0.001 {
+                failures.push(format!(
+                    "iteration {iteration}: concealed window RMS {concealed_rms:.6} looks like hard silence"
+                ));
+            }
+        }
+        let output_wav = if let Some(dir) = output_dir {
+            let path = dir.join(format!("recovered-{iteration:03}.wav"));
+            write_wav_i16(&path, &recovered_pcm, channels, SAMPLE_RATE)
+                .with_context(|| format!("write recovered playback WAV {}", path.display()))?;
+            Some(path.display().to_string())
+        } else {
+            None
+        };
+
+        total_dropped_packets += dropped_count;
+        total_concealed_packets += stats.concealed_packets;
+        total_decode_errors += stats.decode_errors;
+        max_consecutive_missing_packets =
+            max_consecutive_missing_packets.max(stats.max_consecutive_missing_packets);
+        iteration_stats.push(PlaybackRecoveryHarnessIteration {
+            iteration,
+            seed: iteration_seed,
+            dropped_packets: dropped_count,
+            dropped_ranges,
+            loss_window_relative_rms,
+            concealed_rms,
+            output_duration_ms: stats.output_duration_ms,
+            stats,
+            output_wav,
+        });
+    }
+    if min_loss_window_relative_rms.is_infinite() {
+        min_loss_window_relative_rms = 1.0;
+    }
+    if min_concealed_rms.is_infinite() {
+        min_concealed_rms = 0.0;
+    }
+    let summary = PlaybackRecoveryHarnessSummary {
+        mode: "test-playback-recovery",
+        input: input.display().to_string(),
+        iterations,
+        loss_per_mille,
+        max_burst,
+        seed,
+        channels,
+        payload_type,
+        encoded_packets: packets.len(),
+        total_dropped_packets,
+        total_concealed_packets,
+        total_decode_errors,
+        max_consecutive_missing_packets,
+        min_loss_window_relative_rms,
+        min_concealed_rms,
+        iterations_with_loss,
+        failures,
+        iteration_stats,
+    };
+    if let Some(path) = stats_json.as_deref() {
+        std::fs::write(path, serde_json::to_vec_pretty(&summary)?)
+            .with_context(|| format!("write playback recovery stats {}", path.display()))?;
+    }
+    eprintln!(
+        "discord-voice-engine test-playback-recovery: {} iteration(s), {} dropped, {} concealed, {} failure(s)",
+        summary.iterations,
+        summary.total_dropped_packets,
+        summary.total_concealed_packets,
+        summary.failures.len(),
+    );
+    if !summary.failures.is_empty() {
+        bail!(
+            "playback recovery harness failed: {}",
+            summary.failures.join("; ")
+        );
+    }
+    Ok(summary)
+}
+
+fn choose_loss_indices(
+    packet_count: usize,
+    loss_per_mille: u32,
+    max_burst: usize,
+    seed: u64,
+) -> Vec<bool> {
+    let mut dropped = vec![false; packet_count];
+    if packet_count <= 2 || loss_per_mille == 0 {
+        return dropped;
+    }
+    let mut rng = XorShift64::new(seed);
+    let mut index = 1usize;
+    let max_index = packet_count - 1;
+    while index < max_index {
+        if rng.next_u32() % 1000 < loss_per_mille.min(1000) {
+            let burst = 1 + (rng.next_u32() as usize % max_burst.max(1));
+            for offset in 0..burst {
+                let drop_index = index + offset;
+                if drop_index >= max_index {
+                    break;
+                }
+                dropped[drop_index] = true;
+            }
+            index += burst.max(1);
+        } else {
+            index += 1;
+        }
+    }
+    dropped
+}
+
+fn packet_ranges(dropped: &[bool]) -> Vec<PacketRange> {
+    let mut ranges = Vec::new();
+    let mut index = 0usize;
+    while index < dropped.len() {
+        if !dropped[index] {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < dropped.len() && dropped[index] {
+            index += 1;
+        }
+        ranges.push(PacketRange {
+            start,
+            end: index - 1,
+        });
+    }
+    ranges
+}
+
+fn dropped_window_rms(pcm: &[i16], dropped: &[bool], channels: u8) -> f64 {
+    let channels = channels.max(1) as usize;
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for (packet_index, is_dropped) in dropped.iter().enumerate() {
+        if !*is_dropped {
+            continue;
+        }
+        let start = packet_index * FRAME_SAMPLES * channels;
+        let end = (start + (FRAME_SAMPLES * channels)).min(pcm.len());
+        for sample in &pcm[start..end] {
+            let normalized = f64::from(*sample) / 32768.0;
+            sum += normalized * normalized;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        (sum / count as f64).sqrt()
+    }
+}
+
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        (x >> 32) as u32
+    }
 }
 
 fn decode_one_trace_packet(
