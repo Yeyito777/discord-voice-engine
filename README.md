@@ -23,6 +23,15 @@ On Debian/Ubuntu-style systems:
 sudo apt install build-essential pkg-config libopus-dev libpulse-dev
 ```
 
+Build and install with:
+
+```sh
+make
+make install
+```
+
+By default `make install` writes `discord-voice-engine` to `~/.local/bin`. Override with `PREFIX=/usr/local` or another prefix if needed.
+
 ## Commands
 
 ### Encode/send a file as local plain RTP
