@@ -87,3 +87,7 @@ Both clients discover the binary in this order:
 The UDP RTP emitted by the engine is intentionally plain local RTP. Consumers wrap the Opus payloads with their existing DAVE and Discord voice transport layers.
 
 For incoming playback, consumers send decrypted/DAVE-decoded plain RTP to `play-rtp`; the engine owns jitter buffering, Opus decoding, PLC, mixing, and local PipeWire/Pulse/WAV/null output.
+
+## License
+
+MIT

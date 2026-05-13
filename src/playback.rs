@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Write};
 use std::net::UdpSocket;
 use std::path::Path;
@@ -593,6 +593,11 @@ struct LiveStream {
     decoder: OpusStreamDecoder,
     expected_sequence: u16,
     buffer: BTreeMap<u16, RtpAudioPacket>,
+    // Opus RTP packets are not guaranteed to decode to exactly one 20 ms
+    // playback tick. Discord commonly sends 20 ms packets, but 40/60 ms packets
+    // are legal and do show up in the wild. Keep decoded PCM here and drain it
+    // on the fixed local output cadence so longer packets are not truncated.
+    pending_samples: VecDeque<f32>,
     start_at: Instant,
     last_receive: Instant,
     consecutive_plc: usize,
@@ -604,6 +609,7 @@ impl LiveStream {
             decoder: OpusStreamDecoder::new(channels)?,
             expected_sequence: first_sequence,
             buffer: BTreeMap::new(),
+            pending_samples: VecDeque::new(),
             start_at,
             last_receive: Instant::now(),
             consecutive_plc: 0,
@@ -631,44 +637,73 @@ impl LiveStream {
         use_fec: bool,
         stats: &mut PlaybackRecoveryStats,
     ) -> Result<Option<Vec<f32>>> {
-        let mut frame = Vec::new();
-        if let Some(packet) = self.buffer.remove(&self.expected_sequence) {
-            self.decoder
-                .decode_payload_f32(&packet.payload, &mut frame, stats)?;
-            self.expected_sequence = self.expected_sequence.wrapping_add(1);
-            self.consecutive_plc = 0;
-            return Ok(Some(frame));
-        }
-
-        if self.buffer.is_empty()
-            && now.duration_since(self.last_receive) >= Duration::from_millis(idle_timeout_ms)
-            && self.consecutive_plc > 0
-        {
-            return Ok(None);
-        }
-
-        self.consecutive_plc += 1;
-        if self.consecutive_plc > max_plc_packets && self.buffer.is_empty() {
-            return Ok(None);
-        }
-        stats.missing_packets += 1;
-        stats.sequence_gap_events += usize::from(self.consecutive_plc == 1);
-        stats.max_consecutive_missing_packets = stats
-            .max_consecutive_missing_packets
-            .max(self.consecutive_plc);
-        if use_fec {
-            let next = self.expected_sequence.wrapping_add(1);
-            if let Some(next_packet) = self.buffer.get(&next) {
+        let frame_samples = FRAME_SAMPLES * self.decoder.channels as usize;
+        while self.pending_samples.len() < frame_samples {
+            if let Some(packet) = self.buffer.remove(&self.expected_sequence) {
+                let mut decoded = Vec::new();
                 self.decoder
-                    .decode_fec_or_plc_f32(&next_packet.payload, &mut frame, stats)?;
-            } else {
-                self.decoder.decode_plc_f32(&mut frame, stats)?;
+                    .decode_payload_f32(&packet.payload, &mut decoded, stats)?;
+                self.pending_samples.extend(decoded);
+                self.expected_sequence = self.expected_sequence.wrapping_add(1);
+                self.consecutive_plc = 0;
+                continue;
             }
-        } else {
-            self.decoder.decode_plc_f32(&mut frame, stats)?;
+
+            if self.buffer.is_empty()
+                && now.duration_since(self.last_receive) >= Duration::from_millis(idle_timeout_ms)
+                && self.consecutive_plc > 0
+                && self.pending_samples.is_empty()
+            {
+                return Ok(None);
+            }
+
+            self.consecutive_plc += 1;
+            if self.consecutive_plc > max_plc_packets && self.buffer.is_empty() {
+                if self.pending_samples.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            stats.missing_packets += 1;
+            stats.sequence_gap_events += usize::from(self.consecutive_plc == 1);
+            stats.max_consecutive_missing_packets = stats
+                .max_consecutive_missing_packets
+                .max(self.consecutive_plc);
+
+            let mut concealed = Vec::new();
+            if use_fec {
+                let next = self.expected_sequence.wrapping_add(1);
+                if let Some(next_packet) = self.buffer.get(&next) {
+                    self.decoder.decode_fec_or_plc_f32(
+                        &next_packet.payload,
+                        &mut concealed,
+                        stats,
+                    )?;
+                } else {
+                    self.decoder.decode_plc_f32(&mut concealed, stats)?;
+                }
+            } else {
+                self.decoder.decode_plc_f32(&mut concealed, stats)?;
+            }
+            self.pending_samples.extend(concealed);
+            self.expected_sequence = self.expected_sequence.wrapping_add(1);
         }
-        self.expected_sequence = self.expected_sequence.wrapping_add(1);
-        Ok(Some(frame))
+
+        if self.pending_samples.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.pop_output_frame(frame_samples)))
+    }
+
+    fn pop_output_frame(&mut self, frame_samples: usize) -> Vec<f32> {
+        let mut frame = Vec::with_capacity(frame_samples);
+        for _ in 0..frame_samples {
+            match self.pending_samples.pop_front() {
+                Some(sample) => frame.push(sample),
+                None => frame.push(0.0),
+            }
+        }
+        frame
     }
 }
 
@@ -818,6 +853,7 @@ mod tests {
     use crate::encode::encode_float_frames;
     use crate::rtp::build_rtp_packet;
     use crate::{AudioMode, EngineConfig};
+    use opus::{Application, Bitrate, Channels, Encoder};
 
     #[test]
     fn parses_plain_rtp_packet() {
@@ -875,5 +911,66 @@ mod tests {
             concealed_energy > 1_000,
             "PLC should synthesize non-silent continuity"
         );
+    }
+
+    #[test]
+    fn live_playback_splits_multi_frame_opus_packets_across_ticks() {
+        let channels = 2u8;
+        let packet_frames = 3usize;
+        let mut samples = Vec::with_capacity(packet_frames * FRAME_SAMPLES * channels as usize);
+        for n in 0..packet_frames * FRAME_SAMPLES {
+            let t = n as f32 / SAMPLE_RATE as f32;
+            let sample = ((t * 330.0 * std::f32::consts::TAU).sin() * 0.20)
+                + ((t * 660.0 * std::f32::consts::TAU).sin() * 0.05);
+            samples.push(sample);
+            samples.push(sample);
+        }
+
+        let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Stereo, Application::Audio).unwrap();
+        encoder.set_bitrate(Bitrate::Bits(160_000)).unwrap();
+        let mut encoded = vec![0u8; 4096];
+        let len = encoder.encode_float(&samples, &mut encoded).unwrap();
+        encoded.truncate(len);
+
+        let start_at = Instant::now();
+        let mut stream = LiveStream::new(channels, 77, start_at).unwrap();
+        let arrival = Instant::now();
+        assert_eq!(
+            stream.insert(
+                RtpAudioPacket {
+                    sequence: 77,
+                    timestamp: 0,
+                    ssrc: 99,
+                    payload_type: DEFAULT_PAYLOAD_TYPE,
+                    payload: encoded,
+                },
+                arrival,
+            ),
+            PacketInsertResult::Inserted
+        );
+
+        let mut stats = PlaybackRecoveryStats::default();
+        for tick in 0..packet_frames {
+            let frame = stream
+                .decode_next_frame(
+                    arrival + Duration::from_millis((tick as u64) * FRAME_MS as u64),
+                    1_000,
+                    10,
+                    false,
+                    &mut stats,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.len(), FRAME_SAMPLES * channels as usize);
+            assert!(
+                frame.iter().any(|sample| sample.abs() > 0.001),
+                "decoded packet chunk {tick} should contain real audio, not silence/PLC"
+            );
+        }
+
+        assert_eq!(stats.normal_packets, 1);
+        assert_eq!(stats.concealed_packets, 0);
+        assert_eq!(stats.missing_packets, 0);
+        assert_eq!(stream.pending_samples.len(), 0);
     }
 }

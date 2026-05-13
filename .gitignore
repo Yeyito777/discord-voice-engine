@@ -1,1 +1,20 @@
-/target
+/target/
+
+# Rust/Cargo local artifacts
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local editor and OS noise
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local environment overrides
+.env
+.env.*
+
+# Generated diagnostics
+*.wav
+*.pcm
+*.stats.json
