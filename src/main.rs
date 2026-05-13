@@ -12,9 +12,9 @@ use discord_voice_engine::audio::{
 use discord_voice_engine::encode::{decode_frames_to_wav, encode_float_frames};
 use discord_voice_engine::file_input::load_audio_file;
 use discord_voice_engine::playback::{
-    PlaybackOptions, PlaybackOutput, PlaybackRecoveryStats, RtpAudioPacket, play_rtp,
-    recover_ordered_packets_to_pcm,
+    PlaybackRecoveryStats, RtpAudioPacket, recover_ordered_packets_to_pcm,
 };
+use discord_voice_engine::playback_c::{CPlaybackOptions, CPlaybackOutput, play_rtp_c};
 use discord_voice_engine::pulse_capture::{CaptureOptions, capture_mic_to_rtp};
 use discord_voice_engine::rtp::{frame_payloads_to_rtp, send_rtp_frames};
 use discord_voice_engine::{
@@ -345,8 +345,8 @@ fn main() -> Result<()> {
             ready_file,
             fec,
         } => {
-            let output = playback_output_from_args(output, output_wav.as_deref())?;
-            play_rtp(PlaybackOptions {
+            let output = c_playback_output_from_args(output, output_wav.as_deref())?;
+            play_rtp_c(CPlaybackOptions {
                 rtp_addr: &rtp,
                 channels,
                 payload_type,
@@ -354,6 +354,7 @@ fn main() -> Result<()> {
                 idle_timeout_ms,
                 max_plc_packets,
                 output,
+                output_wav: output_wav.as_deref(),
                 duration_ms,
                 stats_json: stats_json.as_deref(),
                 ready_file: ready_file.as_deref(),
@@ -584,19 +585,19 @@ fn decode_trace_command(
     Ok(stats)
 }
 
-fn playback_output_from_args<'a>(
+fn c_playback_output_from_args(
     output: PlaybackOutputArg,
-    output_wav: Option<&'a std::path::Path>,
-) -> Result<PlaybackOutput<'a>> {
+    output_wav: Option<&std::path::Path>,
+) -> Result<CPlaybackOutput> {
     Ok(match output {
-        PlaybackOutputArg::Pipewire => PlaybackOutput::PipeWire,
-        PlaybackOutputArg::Pulse => PlaybackOutput::Pulse,
-        PlaybackOutputArg::Null => PlaybackOutput::Null,
+        PlaybackOutputArg::Pipewire => CPlaybackOutput::PipeWire,
+        PlaybackOutputArg::Pulse => CPlaybackOutput::Pulse,
+        PlaybackOutputArg::Null => CPlaybackOutput::Null,
         PlaybackOutputArg::Wav => {
-            let Some(path) = output_wav else {
+            if output_wav.is_none() {
                 bail!("--output wav requires --output-wav");
-            };
-            PlaybackOutput::Wav(path)
+            }
+            CPlaybackOutput::Wav
         }
     })
 }

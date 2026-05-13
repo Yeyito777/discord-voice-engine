@@ -13,6 +13,16 @@ The engine exists so Record and discord-cli do not each maintain their own ad-ho
 
 It intentionally does **not** talk to Discord. Record and discord-cli still own Discord gateway, DAVE, RTP transport encryption, UDP sockets, and call lifecycle.
 
+## Build requirements
+
+The live playback backend is built from C and links against libopus and PulseAudio's simple client library through `pkg-config` (`opus`, `libpulse-simple`, and `libpulse`).
+
+On Debian/Ubuntu-style systems:
+
+```sh
+sudo apt install build-essential pkg-config libopus-dev libpulse-dev
+```
+
 ## Commands
 
 ### Encode/send a file as local plain RTP
@@ -61,7 +71,7 @@ discord-voice-engine play-rtp \
   --output pipewire
 ```
 
-`play-rtp` is the native replacement for handing RTP to `ffplay`. It receives decrypted/DAVE-decoded local Opus RTP from the client, buffers it on a fixed playout cadence, and uses libopus decoder-state PLC (`decode_float` with an empty packet) for missing frames. Metrics such as received packets, missing packets, concealed packets, late packets, and decode errors are available through `--stats-json`.
+`play-rtp` is the native replacement for handing RTP to `ffplay`. It receives decrypted/DAVE-decoded local Opus RTP from the client, buffers it on a fixed playout cadence, and uses libopus decoder-state PLC (`decode_float` with an empty packet) for missing frames. The live playout backend is implemented in C inside this binary so it can parse RTP, maintain decoder state, mix streams, and feed Pulse/PipeWire directly without a `pw-cat` subprocess. Metrics such as received packets, missing packets, concealed packets, late packets, decode errors, output underruns, and Opus packet duration histograms are available through `--stats-json`.
 
 ### Packet-loss recovery harness
 
