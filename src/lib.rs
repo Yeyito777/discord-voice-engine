@@ -1,6 +1,8 @@
 pub mod audio;
 pub mod encode;
 pub mod file_input;
+pub mod noise_suppression;
+pub mod parent_watchdog;
 pub mod playback;
 pub mod playback_c;
 pub mod pulse_capture;

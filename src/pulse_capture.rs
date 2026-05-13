@@ -1,7 +1,8 @@
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,9 @@ use signal_hook::iterator::Signals;
 
 use crate::audio::{interleaved_i16_to_mono, write_wav_i16};
 use crate::encode::{configure_encoder, encode_i16_frame};
+use crate::noise_suppression::{
+    NoiseSuppressionMode, NoiseSuppressor, parse_noise_suppression_mode,
+};
 use crate::rtp::build_rtp_packet;
 use crate::{EngineConfig, FRAME_SAMPLES, RTP_CLOCK_INCREMENT, SAMPLE_RATE};
 
@@ -23,6 +27,7 @@ pub struct CaptureOptions<'a> {
     pub duration_ms: Option<u64>,
     pub dump_input_pcm: Option<&'a Path>,
     pub stats_json: Option<&'a Path>,
+    pub noise_suppression: NoiseSuppressionMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,6 +42,8 @@ pub struct CaptureStats {
     pub payload_bytes: usize,
     pub bitrate: i32,
     pub capture_backend: &'static str,
+    pub noise_suppression: &'static str,
+    pub noise_suppression_changes: usize,
 }
 
 pub fn build_parec_command(device: Option<&str>, channels: u8) -> Vec<String> {
@@ -91,6 +98,11 @@ pub fn capture_mic_to_rtp(
     let mut encoder = configure_encoder(config)?;
     let mut stdout = io::stdout().lock();
     let mut input_dump: Vec<i16> = Vec::new();
+    let requested_noise_suppression =
+        Arc::new(AtomicU8::new(noise_mode_to_u8(options.noise_suppression)));
+    install_stdin_control_handler(Arc::clone(&requested_noise_suppression));
+    let mut noise_suppressor = NoiseSuppressor::new(options.noise_suppression);
+    let mut noise_suppression_changes = 0usize;
 
     let samples_per_packet = FRAME_SAMPLES * config.channels as usize;
     let bytes_per_packet = samples_per_packet * 2;
@@ -120,6 +132,17 @@ pub fn capture_mic_to_rtp(
         if options.dump_input_pcm.is_some() {
             input_dump.extend_from_slice(&pcm);
         }
+        let requested_mode =
+            noise_mode_from_u8(requested_noise_suppression.load(Ordering::Relaxed));
+        if requested_mode != noise_suppressor.mode() {
+            noise_suppressor.set_mode(requested_mode);
+            noise_suppression_changes += 1;
+            eprintln!(
+                "discord-voice-engine capture-mic: noise suppression set to {}",
+                requested_mode.as_str()
+            );
+        }
+        noise_suppressor.process_interleaved_i16_frame(&mut pcm, config.channels);
         if options.meter_stdout {
             write_meter_pcm(&mut stdout, &pcm, config.channels)?;
         }
@@ -179,15 +202,58 @@ pub fn capture_mic_to_rtp(
         payload_bytes,
         bitrate: config.bitrate,
         capture_backend: "parec",
+        noise_suppression: noise_suppressor.mode().as_str(),
+        noise_suppression_changes,
     };
     if let Some(path) = options.stats_json {
         std::fs::write(path, serde_json::to_vec_pretty(&stats)?)
             .with_context(|| format!("write stats {}", path.display()))?;
     }
     eprintln!(
-        "discord-voice-engine capture-mic: sent {packets} RTP packet(s), {payload_bytes} Opus byte(s) via parec"
+        "discord-voice-engine capture-mic: sent {packets} RTP packet(s), {payload_bytes} Opus byte(s) via parec, noise_suppression={} changes={noise_suppression_changes}",
+        noise_suppressor.mode().as_str()
     );
     Ok(stats)
+}
+
+fn noise_mode_to_u8(mode: NoiseSuppressionMode) -> u8 {
+    match mode {
+        NoiseSuppressionMode::Off => 0,
+        NoiseSuppressionMode::Simple => 1,
+    }
+}
+
+fn noise_mode_from_u8(value: u8) -> NoiseSuppressionMode {
+    match value {
+        1 => NoiseSuppressionMode::Simple,
+        _ => NoiseSuppressionMode::Off,
+    }
+}
+
+fn install_stdin_control_handler(requested_noise_suppression: Arc<AtomicU8>) {
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if let Some(mode) = parse_noise_suppression_control_line(&line) {
+                requested_noise_suppression.store(noise_mode_to_u8(mode), Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+fn parse_noise_suppression_control_line(line: &str) -> Option<NoiseSuppressionMode> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(value) = trimmed.strip_prefix("noise-suppression ") {
+        return parse_noise_suppression_mode(value);
+    }
+    if let Some(value) = trimmed.strip_prefix("set noise-suppression ") {
+        return parse_noise_suppression_mode(value);
+    }
+    None
 }
 
 fn write_meter_pcm<W: Write>(writer: &mut W, pcm: &[i16], channels: u8) -> Result<()> {
@@ -269,6 +335,8 @@ mod tests {
             payload_bytes: 123,
             bitrate: AudioMode::Voice.default_bitrate(2),
             capture_backend: "parec",
+            noise_suppression: "off",
+            noise_suppression_changes: 0,
         };
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("capture-mic"));
@@ -277,6 +345,15 @@ mod tests {
 
         let config = EngineConfig::new(AudioMode::Voice, 2, None, DEFAULT_PAYLOAD_TYPE, 1);
         assert_eq!(config.bitrate, 96_000);
+    }
+
+    #[test]
+    fn parses_stdin_noise_control_lines() {
+        assert_eq!(
+            parse_noise_suppression_control_line("noise-suppression simple"),
+            Some(NoiseSuppressionMode::Simple)
+        );
+        assert_eq!(parse_noise_suppression_control_line("volume 10"), None);
     }
 
     #[test]

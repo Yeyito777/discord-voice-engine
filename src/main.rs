@@ -11,6 +11,8 @@ use discord_voice_engine::audio::{
 };
 use discord_voice_engine::encode::{decode_frames_to_wav, encode_float_frames};
 use discord_voice_engine::file_input::load_audio_file;
+use discord_voice_engine::noise_suppression::NoiseSuppressionMode;
+use discord_voice_engine::parent_watchdog::install_parent_exit_watchdog;
 use discord_voice_engine::playback::{
     PlaybackRecoveryStats, RtpAudioPacket, recover_ordered_packets_to_pcm,
 };
@@ -82,6 +84,11 @@ enum Command {
         dump_input_pcm: Option<PathBuf>,
         #[arg(long)]
         stats_json: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = NoiseSuppressionArg::Off)]
+        noise_suppression: NoiseSuppressionArg,
+        /// Exit automatically if the Record process that launched this helper disappears.
+        #[arg(long)]
+        parent_pid: Option<u32>,
     },
     /// Decode Record's RECORD_PLAYBACK_TRACE_DIR JSONL trace into WAV and packet-loss stats.
     DecodeTrace {
@@ -120,6 +127,9 @@ enum Command {
         ready_file: Option<PathBuf>,
         #[arg(long)]
         fec: bool,
+        /// Exit automatically if the Record process that launched this helper disappears.
+        #[arg(long)]
+        parent_pid: Option<u32>,
     },
     /// Deterministically inject Opus RTP packet loss and verify decoder-state PLC recovery.
     TestPlaybackRecovery {
@@ -158,6 +168,21 @@ enum PlaybackOutputArg {
     Pulse,
     Null,
     Wav,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum NoiseSuppressionArg {
+    Off,
+    Simple,
+}
+
+impl From<NoiseSuppressionArg> for NoiseSuppressionMode {
+    fn from(value: NoiseSuppressionArg) -> Self {
+        match value {
+            NoiseSuppressionArg::Off => NoiseSuppressionMode::Off,
+            NoiseSuppressionArg::Simple => NoiseSuppressionMode::Simple,
+        }
+    }
 }
 
 impl From<ModeArg> for AudioMode {
@@ -308,7 +333,10 @@ fn main() -> Result<()> {
             duration_ms,
             dump_input_pcm,
             stats_json,
+            noise_suppression,
+            parent_pid,
         } => {
+            install_parent_exit_watchdog(parent_pid, "capture-mic");
             let mode = AudioMode::from(mode);
             let config = EngineConfig::new(mode, channels, bitrate, payload_type, ssrc);
             capture_mic_to_rtp(
@@ -320,6 +348,7 @@ fn main() -> Result<()> {
                     duration_ms,
                     dump_input_pcm: dump_input_pcm.as_deref(),
                     stats_json: stats_json.as_deref(),
+                    noise_suppression: NoiseSuppressionMode::from(noise_suppression),
                 },
             )?;
         }
@@ -344,7 +373,9 @@ fn main() -> Result<()> {
             stats_json,
             ready_file,
             fec,
+            parent_pid,
         } => {
+            install_parent_exit_watchdog(parent_pid, "play-rtp");
             let output = c_playback_output_from_args(output, output_wav.as_deref())?;
             play_rtp_c(CPlaybackOptions {
                 rtp_addr: &rtp,
