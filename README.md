@@ -64,10 +64,11 @@ discord-voice-engine capture-mic \
   --mode voice \
   --channels 2 \
   --bitrate 96000 \
+  --gain-db -20 \
   --meter-stdout
 ```
 
-Microphone capture uses `parec` with raw 48 kHz signed 16-bit PCM and explicit 20 ms latency/process-time requests. Rust/libopus still owns encoding, RTP headers, timing counters, and diagnostics. `--meter-stdout` writes mono signed 16-bit little-endian PCM for Record's local speaking meter.
+Microphone capture uses `parec` with raw 48 kHz signed 16-bit PCM and explicit 20 ms latency/process-time requests. Rust/libopus still owns gain (`--gain-db`, plus stdin control lines like `gain-db -12`), encoding, RTP headers, timing counters, and diagnostics. `--meter-stdout` writes mono signed 16-bit little-endian PCM for Record's local speaking meter.
 
 ### Play incoming local plain RTP with recovery
 

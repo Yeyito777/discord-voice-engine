@@ -86,6 +86,9 @@ enum Command {
         stats_json: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = NoiseSuppressionArg::Off)]
         noise_suppression: NoiseSuppressionArg,
+        /// Initial microphone capture gain in dB. 0 dB is neutral/default.
+        #[arg(long, default_value_t = 0.0)]
+        gain_db: f32,
         /// Exit automatically if the Record process that launched this helper disappears.
         #[arg(long)]
         parent_pid: Option<u32>,
@@ -334,6 +337,7 @@ fn main() -> Result<()> {
             dump_input_pcm,
             stats_json,
             noise_suppression,
+            gain_db,
             parent_pid,
         } => {
             install_parent_exit_watchdog(parent_pid, "capture-mic");
@@ -349,6 +353,7 @@ fn main() -> Result<()> {
                     dump_input_pcm: dump_input_pcm.as_deref(),
                     stats_json: stats_json.as_deref(),
                     noise_suppression: NoiseSuppressionMode::from(noise_suppression),
+                    gain_db,
                 },
             )?;
         }

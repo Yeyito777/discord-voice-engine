@@ -28,6 +28,7 @@ pub struct CaptureOptions<'a> {
     pub dump_input_pcm: Option<&'a Path>,
     pub stats_json: Option<&'a Path>,
     pub noise_suppression: NoiseSuppressionMode,
+    pub gain_db: f32,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,6 +45,8 @@ pub struct CaptureStats {
     pub capture_backend: &'static str,
     pub noise_suppression: &'static str,
     pub noise_suppression_changes: usize,
+    pub gain_db: f32,
+    pub gain_changes: usize,
 }
 
 pub fn build_parec_command(device: Option<&str>, channels: u8) -> Vec<String> {
@@ -100,9 +103,15 @@ pub fn capture_mic_to_rtp(
     let mut input_dump: Vec<i16> = Vec::new();
     let requested_noise_suppression =
         Arc::new(AtomicU8::new(noise_mode_to_u8(options.noise_suppression)));
-    install_stdin_control_handler(Arc::clone(&requested_noise_suppression));
+    let requested_gain_db = Arc::new(Mutex::new(options.gain_db));
+    install_stdin_control_handler(
+        Arc::clone(&requested_noise_suppression),
+        Arc::clone(&requested_gain_db),
+    );
     let mut noise_suppressor = NoiseSuppressor::new(options.noise_suppression);
     let mut noise_suppression_changes = 0usize;
+    let mut gain_db = options.gain_db;
+    let mut gain_changes = 0usize;
 
     let samples_per_packet = FRAME_SAMPLES * config.channels as usize;
     let bytes_per_packet = samples_per_packet * 2;
@@ -143,6 +152,13 @@ pub fn capture_mic_to_rtp(
             );
         }
         noise_suppressor.process_interleaved_i16_frame(&mut pcm, config.channels);
+        let requested_gain = read_requested_gain_db(&requested_gain_db);
+        if requested_gain != gain_db {
+            gain_db = requested_gain;
+            gain_changes += 1;
+            eprintln!("discord-voice-engine capture-mic: gain set to {gain_db} dB");
+        }
+        apply_gain_db_interleaved_i16(&mut pcm, gain_db);
         if options.meter_stdout {
             write_meter_pcm(&mut stdout, &pcm, config.channels)?;
         }
@@ -204,16 +220,33 @@ pub fn capture_mic_to_rtp(
         capture_backend: "parec",
         noise_suppression: noise_suppressor.mode().as_str(),
         noise_suppression_changes,
+        gain_db,
+        gain_changes,
     };
     if let Some(path) = options.stats_json {
         std::fs::write(path, serde_json::to_vec_pretty(&stats)?)
             .with_context(|| format!("write stats {}", path.display()))?;
     }
     eprintln!(
-        "discord-voice-engine capture-mic: sent {packets} RTP packet(s), {payload_bytes} Opus byte(s) via parec, noise_suppression={} changes={noise_suppression_changes}",
+        "discord-voice-engine capture-mic: sent {packets} RTP packet(s), {payload_bytes} Opus byte(s) via parec, noise_suppression={} changes={noise_suppression_changes} gain_db={gain_db} gain_changes={gain_changes}",
         noise_suppressor.mode().as_str()
     );
     Ok(stats)
+}
+
+fn read_requested_gain_db(requested_gain_db: &Arc<Mutex<f32>>) -> f32 {
+    requested_gain_db.lock().map(|gain| *gain).unwrap_or(0.0)
+}
+
+fn apply_gain_db_interleaved_i16(pcm: &mut [i16], gain_db: f32) {
+    if !gain_db.is_finite() || gain_db == 0.0 {
+        return;
+    }
+    let linear = 10.0f32.powf(gain_db / 20.0);
+    for sample in pcm {
+        let amplified = (*sample as f32 * linear).round();
+        *sample = amplified.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    }
 }
 
 fn noise_mode_to_u8(mode: NoiseSuppressionMode) -> u8 {
@@ -230,13 +263,22 @@ fn noise_mode_from_u8(value: u8) -> NoiseSuppressionMode {
     }
 }
 
-fn install_stdin_control_handler(requested_noise_suppression: Arc<AtomicU8>) {
+fn install_stdin_control_handler(
+    requested_noise_suppression: Arc<AtomicU8>,
+    requested_gain_db: Arc<Mutex<f32>>,
+) {
     std::thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
             if let Some(mode) = parse_noise_suppression_control_line(&line) {
                 requested_noise_suppression.store(noise_mode_to_u8(mode), Ordering::Relaxed);
+                continue;
+            }
+            if let Some(gain_db) = parse_gain_control_line(&line)
+                && let Ok(mut requested) = requested_gain_db.lock()
+            {
+                *requested = gain_db;
             }
         }
     });
@@ -254,6 +296,40 @@ fn parse_noise_suppression_control_line(line: &str) -> Option<NoiseSuppressionMo
         return parse_noise_suppression_mode(value);
     }
     None
+}
+
+fn parse_gain_control_line(line: &str) -> Option<f32> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for prefix in [
+        "gain-db ",
+        "set gain-db ",
+        "gain ",
+        "set gain ",
+        "volume ",
+        "set volume ",
+    ] {
+        if let Some(value) = trimmed.strip_prefix(prefix) {
+            return parse_gain_db(value);
+        }
+    }
+    None
+}
+
+fn parse_gain_db(value: &str) -> Option<f32> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("reset") {
+        return Some(0.0);
+    }
+    let numeric = trimmed
+        .strip_suffix("dB")
+        .or_else(|| trimmed.strip_suffix("db"))
+        .unwrap_or(trimmed)
+        .trim();
+    let gain = numeric.parse::<f32>().ok()?;
+    gain.is_finite().then_some(gain)
 }
 
 fn write_meter_pcm<W: Write>(writer: &mut W, pcm: &[i16], channels: u8) -> Result<()> {
@@ -337,6 +413,8 @@ mod tests {
             capture_backend: "parec",
             noise_suppression: "off",
             noise_suppression_changes: 0,
+            gain_db: 0.0,
+            gain_changes: 0,
         };
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("capture-mic"));
@@ -354,6 +432,25 @@ mod tests {
             Some(NoiseSuppressionMode::Simple)
         );
         assert_eq!(parse_noise_suppression_control_line("volume 10"), None);
+    }
+
+    #[test]
+    fn parses_stdin_gain_control_lines() {
+        assert_eq!(parse_gain_control_line("gain-db -20"), Some(-20.0));
+        assert_eq!(parse_gain_control_line("set gain -3.5dB"), Some(-3.5));
+        assert_eq!(parse_gain_control_line("volume reset"), Some(0.0));
+        assert_eq!(parse_gain_control_line("noise-suppression simple"), None);
+    }
+
+    #[test]
+    fn applies_gain_db_to_pcm() {
+        let mut pcm = [10_000i16, -10_000, 1_000, -1_000];
+        apply_gain_db_interleaved_i16(&mut pcm, 6.0);
+        assert_eq!(pcm, [19_953, -19_953, 1_995, -1_995]);
+
+        let mut clipped = [20_000i16, -20_000];
+        apply_gain_db_interleaved_i16(&mut clipped, 20.0);
+        assert_eq!(clipped, [i16::MAX, i16::MIN]);
     }
 
     #[test]
