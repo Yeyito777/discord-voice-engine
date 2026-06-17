@@ -9,7 +9,7 @@ The engine exists so Record and discord-cli do not each maintain their own ad-ho
 - Opus encoding through libopus
 - 20 ms Discord RTP cadence and timestamps
 - low-latency PulseAudio/PipeWire microphone capture via `parec` raw PCM
-- incoming Opus RTP jitter buffering and decoder-state packet loss concealment
+- incoming Opus RTP jitter buffering with silence fill for packet loss
 
 It intentionally does **not** talk to Discord. Record and discord-cli still own Discord gateway, DAVE, RTP transport encryption, UDP sockets, and call lifecycle.
 
@@ -81,7 +81,7 @@ discord-voice-engine play-rtp \
   --output pipewire
 ```
 
-`play-rtp` is the native replacement for handing RTP to `ffplay`. It receives decrypted/DAVE-decoded local Opus RTP from the client, buffers it on a fixed playout cadence, and uses libopus decoder-state PLC (`decode_float` with an empty packet) for missing frames. The live playout backend is implemented in C inside this binary so it can parse RTP, maintain decoder state, mix streams, and feed Pulse/PipeWire directly without a `pw-cat` subprocess. Metrics such as received packets, missing packets, concealed packets, late packets, decode errors, output underruns, and Opus packet duration histograms are available through `--stats-json`.
+`play-rtp` is the native replacement for handing RTP to `ffplay`. It receives decrypted/DAVE-decoded local Opus RTP from the client, buffers it on a fixed playout cadence, and fills confirmed packet-loss gaps with silence instead of libopus PLC/FEC so loss sounds like a brief dropout rather than robotic synthesized audio. After loss/resync/decode-error events it resets the Opus decoder predictor state before accepting future real packets, preventing stale pre-gap state from producing post-gap metallic bursts. The live path also mutes decoded full-scale/high-frequency blast frames that look like corrupt encrypted/control data which happened to pass Opus framing. Once playout starts, it keeps the Pulse/PipeWire sink fed with local silence on idle ticks so desktop-audio underflow/resume does not turn Discord talk-spurt gaps into loud pops. The live playout backend is implemented in C inside this binary so it can parse RTP, maintain decoder state, mix streams, and feed Pulse/PipeWire directly without a `pw-cat` subprocess. Metrics such as received packets, missing packets, concealed packets, artifact mutes, decoder resets, silent output frames, late packets, decode errors, output underruns, and Opus packet duration histograms are available through `--stats-json`.
 
 ### Packet-loss recovery harness
 
@@ -106,7 +106,7 @@ Both clients discover the binary in this order:
 
 The UDP RTP emitted by the engine is intentionally plain local RTP. Consumers wrap the Opus payloads with their existing DAVE and Discord voice transport layers.
 
-For incoming playback, consumers send decrypted/DAVE-decoded plain RTP to `play-rtp`; the engine owns jitter buffering, Opus decoding, PLC, mixing, and local PipeWire/Pulse/WAV/null output.
+For incoming playback, consumers send decrypted/DAVE-decoded plain RTP to `play-rtp`; the engine owns jitter buffering, Opus decoding, packet-loss silence fill, mixing, and local PipeWire/Pulse/WAV/null output.
 
 ## License
 
