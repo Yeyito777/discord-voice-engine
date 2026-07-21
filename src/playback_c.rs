@@ -36,6 +36,7 @@ pub struct CPlaybackOptions<'a> {
     pub jitter_ms: u64,
     pub idle_timeout_ms: u64,
     pub max_plc_packets: usize,
+    pub gain_db: f32,
     pub output: CPlaybackOutput,
     pub output_wav: Option<&'a Path>,
     pub duration_ms: Option<u64>,
@@ -70,6 +71,7 @@ pub fn play_rtp_c(options: CPlaybackOptions<'_>) -> Result<()> {
         "--max-plc-packets",
         options.max_plc_packets.to_string(),
     )?;
+    push_arg_pair(&mut args, "--gain-db", options.gain_db.to_string())?;
     push_arg_pair(&mut args, "--output", options.output.as_arg())?;
     if let Some(path) = options.output_wav {
         push_arg_pair(&mut args, "--output-wav", path.display().to_string())?;

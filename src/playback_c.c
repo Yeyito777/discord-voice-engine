@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <float.h>
 #include <math.h>
 #include <netdb.h>
 #include <opus/opus.h>
@@ -44,6 +45,8 @@
 #define DEFAULT_MAX_PLC_PACKETS 10
 #define DEFAULT_MAX_RESYNC_GAP 120
 #define MAX_STREAMS 16
+#define CONTROL_LINE_CAP 512
+#define CONTROL_READ_CAP 1024
 #define ARTIFACT_PEAK_THRESHOLD 0.98f
 #define ARTIFACT_HARD_PEAK_THRESHOLD 0.995f
 #define ARTIFACT_RMS_THRESHOLD 0.28f
@@ -52,10 +55,21 @@
 #define ARTIFACT_CLIPPED_FRACTION_THRESHOLD 0.02f
 
 static volatile sig_atomic_t g_running = 1;
+static int g_stdin_original_flags = -1;
+static bool g_stdin_nonblocking_changed = false;
+static bool g_stdin_restore_registered = false;
 
 static void on_signal(int sig) {
   (void)sig;
   g_running = 0;
+}
+
+static void restore_stdin_flags(void) {
+  if (g_stdin_nonblocking_changed && g_stdin_original_flags >= 0) {
+    (void)fcntl(STDIN_FILENO, F_SETFL, g_stdin_original_flags);
+  }
+  g_stdin_original_flags = -1;
+  g_stdin_nonblocking_changed = false;
 }
 
 static uint64_t monotonic_ms(void) {
@@ -265,6 +279,37 @@ typedef struct {
   uint64_t last_receive_ms;
   uint64_t consecutive_plc;
 } PlaybackStream;
+
+typedef struct UserVolumeControl {
+  uint32_t ssrc;
+  float percent;
+  struct UserVolumeControl *next;
+} UserVolumeControl;
+
+typedef struct {
+  UserVolumeControl *user_volumes;
+  float gain_db;
+  float gain_multiplier;
+} PlaybackControls;
+
+typedef enum {
+  PLAYBACK_CONTROL_NONE = 0,
+  PLAYBACK_CONTROL_USER_VOLUME = 1,
+  PLAYBACK_CONTROL_GAIN_DB = 2,
+} PlaybackControlKind;
+
+typedef struct {
+  PlaybackControlKind kind;
+  uint32_t ssrc;
+  float value;
+} PlaybackControlCommand;
+
+typedef struct {
+  char line[CONTROL_LINE_CAP];
+  size_t line_len;
+  bool discarding_line;
+  bool eof;
+} ControlInput;
 
 static void free_packet_list(RtpPacketNode *node) {
   while (node) {
@@ -696,6 +741,7 @@ typedef struct {
   int idle_timeout_ms;
   int max_plc_packets;
   int max_resync_gap;
+  float gain_db;
   const char *output;
   const char *output_wav;
   const char *ready_file;
@@ -713,6 +759,7 @@ static void options_init(PlaybackOptions *options) {
   options->idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS;
   options->max_plc_packets = DEFAULT_MAX_PLC_PACKETS;
   options->max_resync_gap = DEFAULT_MAX_RESYNC_GAP;
+  options->gain_db = 0.0f;
   options->output = "pipewire";
   options->duration_ms = 0;
 }
@@ -729,12 +776,17 @@ static void usage(FILE *f) {
     "  --idle-timeout-ms N       end idle stream after timeout (default 350)\n"
     "  --max-plc-packets N       max PLC frames after stream dries up (default 10)\n"
     "  --max-resync-gap N        resync instead of PLC for huge sequence jumps (default 120)\n"
+    "  --gain-db DB              initial global playback gain in dB (default 0)\n"
     "  --output pipewire|pulse|null|wav\n"
     "  --output-wav PATH         WAV output path when --output wav\n"
     "  --duration-ms N           stop after N milliseconds\n"
     "  --fec                     try in-band Opus FEC before PLC for isolated gaps\n"
     "  --stats-json PATH         write playback stats JSON on exit\n"
-    "  --ready-file PATH         write a file after UDP bind/output init\n");
+    "  --ready-file PATH         write a file after UDP bind/output init\n"
+    "\n"
+    "stdin controls (one command per line, read nonblocking):\n"
+    "  user-volume SSRC PERCENT set an SSRC's volume; percent is clamped to 0..200\n"
+    "  gain-db DB               set global playback gain in dB\n");
 }
 
 static bool parse_int_arg(const char *value, int *out) {
@@ -744,6 +796,216 @@ static bool parse_int_arg(const char *value, int *out) {
   if (parsed < 0 || parsed > 100000000) return false;
   *out = (int)parsed;
   return true;
+}
+
+static bool parse_u32_arg(const char *value, uint32_t *out) {
+  if (!value[0] || value[0] == '-' || value[0] == '+') return false;
+  errno = 0;
+  char *end = NULL;
+  unsigned long long parsed = strtoull(value, &end, 10);
+  if (errno != 0 || end == value || (end && *end) || parsed > UINT32_MAX) return false;
+  *out = (uint32_t)parsed;
+  return true;
+}
+
+static bool parse_float_arg(const char *value, float *out) {
+  errno = 0;
+  char *end = NULL;
+  float parsed = strtof(value, &end);
+  if (errno != 0 || end == value || (end && *end) || !isfinite(parsed)) return false;
+  *out = parsed;
+  return true;
+}
+
+static float gain_db_to_multiplier(float gain_db) {
+  double multiplier = pow(10.0, (double)gain_db / 20.0);
+  if (!isfinite(multiplier) || multiplier > FLT_MAX) return FLT_MAX;
+  return (float)multiplier;
+}
+
+static void playback_controls_init(PlaybackControls *controls, float gain_db) {
+  memset(controls, 0, sizeof(*controls));
+  controls->gain_db = gain_db;
+  controls->gain_multiplier = gain_db_to_multiplier(gain_db);
+}
+
+static void playback_controls_destroy(PlaybackControls *controls) {
+  UserVolumeControl *entry = controls->user_volumes;
+  while (entry) {
+    UserVolumeControl *next = entry->next;
+    free(entry);
+    entry = next;
+  }
+  controls->user_volumes = NULL;
+}
+
+static bool playback_controls_set_user_volume(PlaybackControls *controls, uint32_t ssrc, float percent) {
+  UserVolumeControl **cursor = &controls->user_volumes;
+  while (*cursor && (*cursor)->ssrc != ssrc) cursor = &(*cursor)->next;
+
+  if (percent == 100.0f) {
+    if (*cursor) {
+      UserVolumeControl *removed = *cursor;
+      *cursor = removed->next;
+      free(removed);
+    }
+    return true;
+  }
+
+  if (*cursor) {
+    (*cursor)->percent = percent;
+    return true;
+  }
+
+  UserVolumeControl *entry = (UserVolumeControl *)calloc(1, sizeof(*entry));
+  if (!entry) return false;
+  entry->ssrc = ssrc;
+  entry->percent = percent;
+  entry->next = controls->user_volumes;
+  controls->user_volumes = entry;
+  return true;
+}
+
+static float playback_controls_user_multiplier(const PlaybackControls *controls, uint32_t ssrc) {
+  for (const UserVolumeControl *entry = controls->user_volumes; entry; entry = entry->next) {
+    if (entry->ssrc == ssrc) return entry->percent / 100.0f;
+  }
+  return 1.0f;
+}
+
+static void playback_controls_set_gain_db(PlaybackControls *controls, float gain_db) {
+  controls->gain_db = gain_db;
+  controls->gain_multiplier = gain_db_to_multiplier(gain_db);
+}
+
+static bool parse_playback_control_line(const char *line, PlaybackControlCommand *out) {
+  char command[32];
+  char first[64];
+  char second[64];
+  char extra[2];
+  memset(out, 0, sizeof(*out));
+  int fields = sscanf(line, " %31s %63s %63s %1s", command, first, second, extra);
+
+  if (fields == 3 && strcmp(command, "user-volume") == 0) {
+    float percent = 0.0f;
+    if (!parse_u32_arg(first, &out->ssrc) || !parse_float_arg(second, &percent)) return false;
+    if (percent <= 0.0f) percent = 0.0f;
+    if (percent > 200.0f) percent = 200.0f;
+    out->kind = PLAYBACK_CONTROL_USER_VOLUME;
+    out->value = percent;
+    return true;
+  }
+
+  if (fields == 2 && strcmp(command, "gain-db") == 0) {
+    if (!parse_float_arg(first, &out->value)) return false;
+    out->kind = PLAYBACK_CONTROL_GAIN_DB;
+    return true;
+  }
+
+  return false;
+}
+
+static void apply_playback_control_line(const char *line, PlaybackControls *controls) {
+  PlaybackControlCommand command;
+  if (!parse_playback_control_line(line, &command)) return;
+
+  if (command.kind == PLAYBACK_CONTROL_USER_VOLUME) {
+    if (!playback_controls_set_user_volume(controls, command.ssrc, command.value)) {
+      fprintf(stderr, "discord-voice-engine play-rtp: unable to store user volume for SSRC %u\n", command.ssrc);
+      return;
+    }
+    fprintf(stderr, "discord-voice-engine play-rtp: user volume for SSRC %u set to %.2f%%\n", command.ssrc, command.value);
+  } else if (command.kind == PLAYBACK_CONTROL_GAIN_DB) {
+    playback_controls_set_gain_db(controls, command.value);
+    fprintf(stderr, "discord-voice-engine play-rtp: gain set to %.2f dB\n", command.value);
+  }
+}
+
+static void control_input_finish_line(ControlInput *input, PlaybackControls *controls) {
+  if (!input->discarding_line) {
+    input->line[input->line_len] = '\0';
+    apply_playback_control_line(input->line, controls);
+  }
+  input->line_len = 0;
+  input->discarding_line = false;
+}
+
+static void control_input_consume(ControlInput *input, PlaybackControls *controls, const char *data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    if (data[i] == '\n') {
+      control_input_finish_line(input, controls);
+    } else if (!input->discarding_line) {
+      if (input->line_len + 1u < sizeof(input->line)) {
+        input->line[input->line_len++] = data[i];
+      } else {
+        input->line_len = 0;
+        input->discarding_line = true;
+      }
+    }
+  }
+}
+
+static void control_input_init(ControlInput *input) {
+  memset(input, 0, sizeof(*input));
+  int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+  if (flags < 0) {
+    input->eof = true;
+    return;
+  }
+  g_stdin_original_flags = flags;
+  if ((flags & O_NONBLOCK) == 0) {
+    if (fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK) < 0) {
+      g_stdin_original_flags = -1;
+      input->eof = true;
+      return;
+    }
+    g_stdin_nonblocking_changed = true;
+    if (!g_stdin_restore_registered) {
+      if (atexit(restore_stdin_flags) == 0) g_stdin_restore_registered = true;
+    }
+  }
+}
+
+static void control_input_drain(ControlInput *input, PlaybackControls *controls) {
+  if (input->eof) return;
+  char buffer[CONTROL_READ_CAP];
+  while (true) {
+    ssize_t len = read(STDIN_FILENO, buffer, sizeof(buffer));
+    if (len > 0) {
+      control_input_consume(input, controls, buffer, (size_t)len);
+      continue;
+    }
+    if (len == 0) {
+      if (input->line_len > 0 || input->discarding_line) control_input_finish_line(input, controls);
+      input->eof = true;
+      return;
+    }
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+    input->eof = true;
+    return;
+  }
+}
+
+static float clamp_pcm_sample(double sample) {
+  if (sample > 1.0) return 1.0f;
+  if (sample < -1.0) return -1.0f;
+  if (!isfinite(sample)) return 0.0f;
+  return (float)sample;
+}
+
+static void mix_scaled_pcm(float *mix, const float *pcm, size_t count, float multiplier) {
+  // Keep the intermediate mix unclipped so later global attenuation and
+  // cancellation between participants retain their intended levels.
+  for (size_t i = 0; i < count; i++) {
+    mix[i] += pcm[i] * multiplier;
+  }
+}
+
+static void apply_pcm_gain(float *pcm, size_t count, float multiplier) {
+  for (size_t i = 0; i < count; i++) {
+    pcm[i] = clamp_pcm_sample((double)pcm[i] * (double)multiplier);
+  }
 }
 
 static bool parse_play_rtp_args(int argc, const char **argv, PlaybackOptions *options) {
@@ -765,6 +1027,7 @@ static bool parse_play_rtp_args(int argc, const char **argv, PlaybackOptions *op
     else if (strcmp(arg, "--idle-timeout-ms") == 0) { NEED_VALUE(); if (!parse_int_arg(value, &options->idle_timeout_ms)) return false; i++; }
     else if (strcmp(arg, "--max-plc-packets") == 0) { NEED_VALUE(); if (!parse_int_arg(value, &options->max_plc_packets)) return false; i++; }
     else if (strcmp(arg, "--max-resync-gap") == 0) { NEED_VALUE(); if (!parse_int_arg(value, &options->max_resync_gap)) return false; i++; }
+    else if (strcmp(arg, "--gain-db") == 0) { NEED_VALUE(); if (!parse_float_arg(value, &options->gain_db)) return false; i++; }
     else if (strcmp(arg, "--output") == 0) { NEED_VALUE(); options->output = value; i++; }
     else if (strcmp(arg, "--output-wav") == 0) { NEED_VALUE(); options->output_wav = value; i++; }
     else if (strcmp(arg, "--ready-file") == 0) { NEED_VALUE(); options->ready_file = value; i++; }
@@ -868,9 +1131,17 @@ static bool ingest_packet(const uint8_t *packet, size_t len, PlaybackOptions *op
   return stream_insert_packet(stream, &parsed, stats);
 }
 
-static void drain_socket_until(int fd, uint64_t deadline_ms, PlaybackOptions *options, PlaybackStream streams[MAX_STREAMS], PlaybackStats *stats) {
+static void drain_socket_until(
+    int fd,
+    uint64_t deadline_ms,
+    PlaybackOptions *options,
+    PlaybackStream streams[MAX_STREAMS],
+    PlaybackStats *stats,
+    ControlInput *control_input,
+    PlaybackControls *controls) {
   uint8_t buffer[MAX_PACKET_SIZE];
   while (g_running) {
+    control_input_drain(control_input, controls);
     ssize_t len = recv(fd, buffer, sizeof(buffer), 0);
     if (len > 0) {
       ingest_packet(buffer, (size_t)len, options, streams, stats);
@@ -884,10 +1155,18 @@ static void drain_socket_until(int fd, uint64_t deadline_ms, PlaybackOptions *op
       fd_set rfds;
       FD_ZERO(&rfds);
       FD_SET(fd, &rfds);
+      int max_fd = fd;
+      if (!control_input->eof) {
+        FD_SET(STDIN_FILENO, &rfds);
+        if (STDIN_FILENO > max_fd) max_fd = STDIN_FILENO;
+      }
       struct timeval tv;
       tv.tv_sec = (time_t)(wait_ms / 1000u);
       tv.tv_usec = (suseconds_t)((wait_ms % 1000u) * 1000u);
-      (void)select(fd + 1, &rfds, NULL, NULL, &tv);
+      int ready = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+      if (ready > 0 && !control_input->eof && FD_ISSET(STDIN_FILENO, &rfds)) {
+        control_input_drain(control_input, controls);
+      }
       continue;
     }
     if (len < 0 && errno == EINTR) continue;
@@ -971,11 +1250,23 @@ static void write_stats_json(const char *path, const PlaybackStats *stats) {
 }
 
 static int play_rtp(PlaybackOptions *options) {
+  PlaybackControls controls;
+  playback_controls_init(&controls, options->gain_db);
+  ControlInput control_input;
+  // Configure stdin before opening the UDP socket. If the caller closed stdin,
+  // socket() may reuse fd 0 and it must not be mistaken for the control stream.
+  control_input_init(&control_input);
+
   int fd = bind_udp_socket(options->rtp_addr);
   if (fd < 0) die("failed to bind RTP socket %s: %s", options->rtp_addr, strerror(errno));
 
   PcmSink sink;
-  if (!sink_open(&sink, options->output, options->output_wav, options->channels)) return 1;
+  if (!sink_open(&sink, options->output, options->output_wav, options->channels)) {
+    playback_controls_destroy(&controls);
+    restore_stdin_flags();
+    close(fd);
+    return 1;
+  }
   if (options->ready_file) {
     FILE *ready = fopen(options->ready_file, "w");
     if (ready) {
@@ -1001,6 +1292,7 @@ static int play_rtp(PlaybackOptions *options) {
   if (!mix || !frame) die("out of memory allocating mix buffers");
 
   while (g_running) {
+    control_input_drain(&control_input, &controls);
     uint64_t now = monotonic_ms();
     if (stop_ms && now >= stop_ms) break;
     if (options->stats_json && now >= last_stats_write_ms + 1000u) {
@@ -1014,11 +1306,19 @@ static int play_rtp(PlaybackOptions *options) {
       fd_set rfds;
       FD_ZERO(&rfds);
       FD_SET(fd, &rfds);
+      int max_fd = fd;
+      if (!control_input.eof) {
+        FD_SET(STDIN_FILENO, &rfds);
+        if (STDIN_FILENO > max_fd) max_fd = STDIN_FILENO;
+      }
       struct timeval tv;
       tv.tv_sec = 0;
       tv.tv_usec = 5000;
-      int ready = select(fd + 1, &rfds, NULL, NULL, &tv);
-      if (ready > 0) {
+      int ready = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+      if (ready > 0 && !control_input.eof && FD_ISSET(STDIN_FILENO, &rfds)) {
+        control_input_drain(&control_input, &controls);
+      }
+      if (ready > 0 && FD_ISSET(fd, &rfds)) {
         ssize_t len = recv(fd, packet, sizeof(packet), 0);
         if (len > 0) {
           ingest_packet(packet, (size_t)len, options, streams, &stats);
@@ -1029,7 +1329,7 @@ static int play_rtp(PlaybackOptions *options) {
     }
 
     if (!next_tick_ms) next_tick_ms = monotonic_ms() + (uint64_t)options->jitter_ms;
-    drain_socket_until(fd, next_tick_ms, options, streams, &stats);
+    drain_socket_until(fd, next_tick_ms, options, streams, &stats, &control_input, &controls);
     sleep_until_ms(next_tick_ms);
     now = monotonic_ms();
 
@@ -1047,12 +1347,8 @@ static int play_rtp(PlaybackOptions *options) {
                                                    &stats, frame);
       if (result == STREAM_FRAME_AUDIO) {
         active++;
-        for (size_t s = 0; s < frame_samples; s++) {
-          float mixed = mix[s] + frame[s];
-          if (mixed > 1.0f) mixed = 1.0f;
-          if (mixed < -1.0f) mixed = -1.0f;
-          mix[s] = mixed;
-        }
+        float user_multiplier = playback_controls_user_multiplier(&controls, streams[i].ssrc);
+        mix_scaled_pcm(mix, frame, frame_samples, user_multiplier);
       } else if (result == STREAM_FRAME_ENDED) {
         stream_destroy(&streams[i]);
         stats.streams_ended++;
@@ -1064,6 +1360,7 @@ static int play_rtp(PlaybackOptions *options) {
     // underflow and then resume, which can manifest as random loud pops/bangs.
     // Silence here is local output keepalive, not Opus PLC/audio synthesis.
     if (active > 0 || next_tick_ms) {
+      apply_pcm_gain(mix, frame_samples, controls.gain_multiplier);
       if (!sink_write_frame(&sink, mix, frame_samples)) break;
       stats.output_frames += FRAME_SAMPLES;
       if (active == 0) stats.silent_output_frames += FRAME_SAMPLES;
@@ -1088,6 +1385,8 @@ static int play_rtp(PlaybackOptions *options) {
   for (size_t i = 0; i < MAX_STREAMS; i++) stream_destroy(&streams[i]);
   free(mix);
   free(frame);
+  playback_controls_destroy(&controls);
+  restore_stdin_flags();
   sink_close(&sink);
   close(fd);
   return 0;
@@ -1153,6 +1452,83 @@ static void run_self_tests(void) {
   }
   test_assert(!decoded_audio_looks_like_artifact(quiet_tone, sizeof(quiet_tone) / sizeof(quiet_tone[0])), "quiet tone is not artifact-muted");
   test_assert(decoded_audio_looks_like_artifact(clipped_noise, sizeof(clipped_noise) / sizeof(clipped_noise[0])), "clipped alternating noise is artifact-muted");
+
+  PlaybackControlCommand control_command;
+  test_assert(parse_playback_control_line("user-volume 1432778632 75", &control_command), "parse user-volume control");
+  test_assert(control_command.kind == PLAYBACK_CONTROL_USER_VOLUME, "user-volume control kind");
+  test_assert(control_command.ssrc == 1432778632u, "user-volume SSRC");
+  test_assert(control_command.value == 75.0f, "user-volume percent");
+  test_assert(parse_playback_control_line("user-volume 4294967295 -10", &control_command), "parse minimum-clamped user-volume");
+  test_assert(control_command.ssrc == UINT32_MAX, "maximum SSRC accepted");
+  test_assert(control_command.value == 0.0f, "user-volume clamps below zero");
+  test_assert(parse_playback_control_line("user-volume 1 250.5", &control_command), "parse maximum-clamped user-volume");
+  test_assert(control_command.value == 200.0f, "user-volume clamps above 200");
+  test_assert(!parse_playback_control_line("user-volume 4294967296 100", &control_command), "reject out-of-range SSRC");
+  test_assert(!parse_playback_control_line("user-volume 1 NaN", &control_command), "reject non-finite user-volume");
+  test_assert(!parse_playback_control_line("user-volume 1 50 trailing", &control_command), "reject extra user-volume fields");
+  test_assert(parse_playback_control_line("gain-db -6.25", &control_command), "parse gain-db control");
+  test_assert(control_command.kind == PLAYBACK_CONTROL_GAIN_DB, "gain-db control kind");
+  test_assert(control_command.value == -6.25f, "gain-db value");
+  test_assert(!parse_playback_control_line("gain-db inf", &control_command), "reject non-finite gain-db");
+
+  PlaybackOptions parsed_options;
+  const char *gain_argv[] = {"discord-voice-engine", "play-rtp", "--rtp", "127.0.0.1:1234", "--gain-db", "3.5"};
+  test_assert(parse_play_rtp_args((int)(sizeof(gain_argv) / sizeof(gain_argv[0])), gain_argv, &parsed_options), "parse initial --gain-db");
+  test_assert(parsed_options.gain_db == 3.5f, "initial --gain-db value");
+
+  PlaybackControls controls;
+  playback_controls_init(&controls, 0.0f);
+  test_assert(playback_controls_user_multiplier(&controls, 77) == 1.0f, "unconfigured SSRC defaults to 100 percent");
+  test_assert(playback_controls_set_user_volume(&controls, 77, 25.0f), "store SSRC volume");
+  test_assert(playback_controls_user_multiplier(&controls, 77) == 0.25f, "stored SSRC volume multiplier");
+  test_assert(playback_controls_user_multiplier(&controls, 78) == 1.0f, "other SSRC keeps default volume");
+
+  float source_pcm[] = {0.4f, -0.4f, 0.75f};
+  float mixed_pcm[] = {0.0f, 0.0f, 0.0f};
+  mix_scaled_pcm(mixed_pcm, source_pcm, sizeof(source_pcm) / sizeof(source_pcm[0]),
+                 playback_controls_user_multiplier(&controls, 77));
+  test_assert(fabsf(mixed_pcm[0] - 0.1f) < 0.0001f, "per-SSRC PCM scales before mixing");
+  test_assert(fabsf(mixed_pcm[1] + 0.1f) < 0.0001f, "negative per-SSRC PCM scales before mixing");
+  playback_controls_set_gain_db(&controls, 6.0206f);
+  test_assert(fabsf(controls.gain_multiplier - 2.0f) < 0.0001f, "dB gain converts to linear multiplier");
+  apply_pcm_gain(mixed_pcm, sizeof(mixed_pcm) / sizeof(mixed_pcm[0]), controls.gain_multiplier);
+  test_assert(fabsf(mixed_pcm[0] - 0.2f) < 0.0001f, "global gain scales mixed PCM");
+  float clipping_mix[] = {0.0f};
+  float clipping_source[] = {0.75f};
+  mix_scaled_pcm(clipping_mix, clipping_source, 1, 2.0f);
+  test_assert(fabsf(clipping_mix[0] - 1.5f) < 0.0001f, "per-user boost remains unclipped before global gain");
+  apply_pcm_gain(clipping_mix, 1, 0.5f);
+  test_assert(fabsf(clipping_mix[0] - 0.75f) < 0.0001f, "global attenuation preserves boosted source level");
+  float cancellation_mix[] = {0.0f};
+  float positive_source[] = {0.75f};
+  float negative_source[] = {-0.75f};
+  mix_scaled_pcm(cancellation_mix, positive_source, 1, 2.0f);
+  mix_scaled_pcm(cancellation_mix, negative_source, 1, 2.0f);
+  apply_pcm_gain(cancellation_mix, 1, 1.0f);
+  test_assert(fabsf(cancellation_mix[0]) < 0.0001f, "unclipped sources can cancel before output");
+
+  int stdin_flags_before = fcntl(STDIN_FILENO, F_GETFL, 0);
+  if (stdin_flags_before >= 0) {
+    ControlInput live_input;
+    control_input_init(&live_input);
+    int stdin_flags_during = fcntl(STDIN_FILENO, F_GETFL, 0);
+    test_assert(stdin_flags_during >= 0 && (stdin_flags_during & O_NONBLOCK) != 0, "stdin control enables nonblocking reads");
+    restore_stdin_flags();
+    test_assert(fcntl(STDIN_FILENO, F_GETFL, 0) == stdin_flags_before, "stdin flags are restored after playback");
+  }
+
+  ControlInput test_input;
+  memset(&test_input, 0, sizeof(test_input));
+  const char *partial_control = "user-volume 88 2";
+  control_input_consume(&test_input, &controls, partial_control, strlen(partial_control));
+  test_assert(playback_controls_user_multiplier(&controls, 88) == 1.0f, "partial stdin control waits for newline");
+  const char *completed_controls = "50\ngain-db -3\n";
+  control_input_consume(&test_input, &controls, completed_controls, strlen(completed_controls));
+  test_assert(playback_controls_user_multiplier(&controls, 88) == 2.0f, "stdin control clamps and updates SSRC volume");
+  test_assert(controls.gain_db == -3.0f, "stdin control updates runtime gain");
+  test_assert(playback_controls_set_user_volume(&controls, 77, 100.0f), "reset SSRC volume to default");
+  test_assert(playback_controls_user_multiplier(&controls, 77) == 1.0f, "100 percent removes SSRC override");
+  playback_controls_destroy(&controls);
 
   int channels = 2;
   PlaybackStats stats;

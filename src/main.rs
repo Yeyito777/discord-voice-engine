@@ -105,6 +105,8 @@ enum Command {
         stats_json: Option<PathBuf>,
     },
     /// Receive plain Opus RTP, run jitter-buffered Opus PLC recovery, and play decoded PCM.
+    ///
+    /// Runtime stdin controls: `user-volume <ssrc> <percent>` and `gain-db <db>`.
     PlayRtp {
         #[arg(long)]
         rtp: String,
@@ -118,6 +120,9 @@ enum Command {
         idle_timeout_ms: u64,
         #[arg(long, default_value_t = 10)]
         max_plc_packets: usize,
+        /// Initial global playback gain in dB. Runtime updates use `gain-db <db>` on stdin.
+        #[arg(long, default_value_t = 0.0)]
+        gain_db: f32,
         #[arg(long, value_enum, default_value_t = PlaybackOutputArg::Pipewire)]
         output: PlaybackOutputArg,
         #[arg(long)]
@@ -372,6 +377,7 @@ fn main() -> Result<()> {
             jitter_ms,
             idle_timeout_ms,
             max_plc_packets,
+            gain_db,
             output,
             output_wav,
             duration_ms,
@@ -389,6 +395,7 @@ fn main() -> Result<()> {
                 jitter_ms,
                 idle_timeout_ms,
                 max_plc_packets,
+                gain_db,
                 output,
                 output_wav: output_wav.as_deref(),
                 duration_ms,
