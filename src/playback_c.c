@@ -47,13 +47,6 @@
 #define MAX_STREAMS 16
 #define CONTROL_LINE_CAP 512
 #define CONTROL_READ_CAP 1024
-#define ARTIFACT_PEAK_THRESHOLD 0.98f
-#define ARTIFACT_HARD_PEAK_THRESHOLD 0.995f
-#define ARTIFACT_RMS_THRESHOLD 0.28f
-#define ARTIFACT_HARD_RMS_THRESHOLD 0.50f
-#define ARTIFACT_ZERO_CROSSING_THRESHOLD 0.24f
-#define ARTIFACT_CLIPPED_FRACTION_THRESHOLD 0.02f
-
 static volatile sig_atomic_t g_running = 1;
 static int g_stdin_original_flags = -1;
 static bool g_stdin_nonblocking_changed = false;
@@ -100,6 +93,7 @@ static void die(const char *fmt, ...) {
 }
 
 static int16_t float_to_i16(float sample) {
+  if (!isfinite(sample)) return 0;
   if (sample > 1.0f) sample = 1.0f;
   if (sample < -1.0f) sample = -1.0f;
   float scaled = sample * 32767.0f;
@@ -235,7 +229,6 @@ typedef struct {
   uint64_t dropped_wrong_payload_packets;
   uint64_t dropped_ssrc_packets;
   uint64_t decode_errors;
-  uint64_t artifact_mutes;
   uint64_t decoder_resets;
   uint64_t resync_events;
   uint64_t streams_started;
@@ -415,41 +408,6 @@ static bool stream_insert_packet(PlaybackStream *stream, const ParsedRtp *parsed
   return true;
 }
 
-static bool decoded_audio_looks_like_artifact(const float *samples, size_t count) {
-  if (count == 0) return false;
-  double sum_sq = 0.0;
-  float peak = 0.0f;
-  size_t clipped = 0;
-  size_t sign_samples = 0;
-  size_t sign_changes = 0;
-  int previous_sign = 0;
-
-  for (size_t i = 0; i < count; i++) {
-    float sample = samples[i];
-    if (!isfinite(sample)) return true;
-    float abs_sample = fabsf(sample);
-    if (abs_sample > peak) peak = abs_sample;
-    sum_sq += (double)sample * (double)sample;
-    if (abs_sample >= ARTIFACT_PEAK_THRESHOLD) clipped++;
-
-    if (abs_sample > 0.02f) {
-      int sign = sample < 0.0f ? -1 : 1;
-      if (previous_sign != 0 && sign != previous_sign) sign_changes++;
-      previous_sign = sign;
-      sign_samples++;
-    }
-  }
-
-  float rms = (float)sqrt(sum_sq / (double)count);
-  float zero_crossing_rate = sign_samples > 1 ? (float)sign_changes / (float)(sign_samples - 1u) : 0.0f;
-  float clipped_fraction = (float)clipped / (float)count;
-
-  if (peak >= ARTIFACT_HARD_PEAK_THRESHOLD && rms >= ARTIFACT_HARD_RMS_THRESHOLD) return true;
-  if (peak >= ARTIFACT_PEAK_THRESHOLD && rms >= ARTIFACT_RMS_THRESHOLD && zero_crossing_rate >= ARTIFACT_ZERO_CROSSING_THRESHOLD) return true;
-  if (clipped_fraction >= ARTIFACT_CLIPPED_FRACTION_THRESHOLD && rms >= ARTIFACT_RMS_THRESHOLD && zero_crossing_rate >= 0.16f) return true;
-  return false;
-}
-
 static int decode_packet_into_pending(PlaybackStream *stream, RtpPacketNode *packet, int channels, PlaybackStats *stats) {
   float decoded[OPUS_MAX_FRAME_SAMPLES * 2];
   int samples = opus_decode_float(stream->decoder, packet->payload, (opus_int32)packet->payload_len, decoded, OPUS_MAX_FRAME_SAMPLES, 0);
@@ -459,11 +417,11 @@ static int decode_packet_into_pending(PlaybackStream *stream, RtpPacketNode *pac
     return -1;
   }
   size_t count = (size_t)samples * (size_t)channels;
-  if (decoded_audio_looks_like_artifact(decoded, count)) {
-    stream_reset_decoder_state(stream, stats, true);
-    memset(decoded, 0, count * sizeof(float));
-    stats->artifact_mutes++;
-  }
+  // A successful Opus decode is authoritative. Do not classify decoded PCM by
+  // peak, RMS, clipping, or zero crossings: full-scale music is valid, codec
+  // overshoot can exceed +/-1.0, and interleaved stereo channels are not
+  // consecutive points in one waveform. The former heuristic falsely replaced
+  // loud music frames with silence, making music bots sound badly chopped.
   if (!fifo_append(&stream->pending, decoded, count)) die("out of memory appending decoded Opus");
   stats->normal_packets++;
   stats->decoded_packets++;
@@ -1202,7 +1160,6 @@ static void write_stats_json(const char *path, const PlaybackStats *stats) {
     "  \"dropped_wrong_payload_packets\": %llu,\n"
     "  \"dropped_ssrc_packets\": %llu,\n"
     "  \"decode_errors\": %llu,\n"
-    "  \"artifact_mutes\": %llu,\n"
     "  \"decoder_resets\": %llu,\n"
     "  \"resync_events\": %llu,\n"
     "  \"streams_started\": %llu,\n"
@@ -1230,7 +1187,6 @@ static void write_stats_json(const char *path, const PlaybackStats *stats) {
     (unsigned long long)stats->dropped_wrong_payload_packets,
     (unsigned long long)stats->dropped_ssrc_packets,
     (unsigned long long)stats->decode_errors,
-    (unsigned long long)stats->artifact_mutes,
     (unsigned long long)stats->decoder_resets,
     (unsigned long long)stats->resync_events,
     (unsigned long long)stats->streams_started,
@@ -1372,13 +1328,12 @@ static int play_rtp(PlaybackOptions *options) {
   stats.output_duration_ms = (stats.output_frames * 1000u) / SAMPLE_RATE;
   write_stats_json(options->stats_json, &stats);
   fprintf(stderr,
-          "discord-voice-engine: received %llu packet(s), decoded %llu, concealed %llu, missing %llu, late %llu, artifact_mutes %llu, decoder_resets %llu, errors %llu\n",
+          "discord-voice-engine: received %llu packet(s), decoded %llu, concealed %llu, missing %llu, late %llu, decoder_resets %llu, errors %llu\n",
           (unsigned long long)stats.received_packets,
           (unsigned long long)stats.normal_packets,
           (unsigned long long)stats.concealed_packets,
           (unsigned long long)stats.missing_packets,
           (unsigned long long)stats.late_packets,
-          (unsigned long long)stats.artifact_mutes,
           (unsigned long long)stats.decoder_resets,
           (unsigned long long)stats.decode_errors);
 
@@ -1413,7 +1368,14 @@ static void test_assert(bool condition, const char *message) {
   if (!condition) die("self-test failed: %s", message);
 }
 
-static void encode_tone_packet(int channels, int frames_20ms, uint8_t *payload, opus_int32 *payload_len) {
+static void encode_test_tone_packet(
+    int channels,
+    int frames_20ms,
+    float amplitude,
+    float frequency,
+    bool invert_right,
+    uint8_t *payload,
+    opus_int32 *payload_len) {
   int err = OPUS_OK;
   OpusEncoder *encoder = opus_encoder_create(SAMPLE_RATE, channels, OPUS_APPLICATION_AUDIO, &err);
   if (!encoder || err != OPUS_OK) die("self-test: failed to create Opus encoder");
@@ -1423,13 +1385,19 @@ static void encode_tone_packet(int channels, int frames_20ms, uint8_t *payload, 
   if (!pcm) die("self-test: out of memory");
   for (int n = 0; n < samples_per_channel; n++) {
     float t = (float)n / (float)SAMPLE_RATE;
-    float sample = sinf(t * 330.0f * 6.28318530718f) * 0.20f;
-    for (int ch = 0; ch < channels; ch++) pcm[(size_t)n * (size_t)channels + (size_t)ch] = sample;
+    float sample = sinf(t * frequency * 6.28318530718f) * amplitude;
+    for (int ch = 0; ch < channels; ch++) {
+      pcm[(size_t)n * (size_t)channels + (size_t)ch] = invert_right && ch == 1 ? -sample : sample;
+    }
   }
   *payload_len = opus_encode_float(encoder, pcm, samples_per_channel, payload, MAX_PAYLOAD_SIZE);
   if (*payload_len <= 0) die("self-test: failed to encode Opus packet");
   free(pcm);
   opus_encoder_destroy(encoder);
+}
+
+static void encode_tone_packet(int channels, int frames_20ms, uint8_t *payload, opus_int32 *payload_len) {
+  encode_test_tone_packet(channels, frames_20ms, 0.20f, 330.0f, false, payload, payload_len);
 }
 
 static void run_self_tests(void) {
@@ -1444,14 +1412,7 @@ static void run_self_tests(void) {
   test_assert(parsed.ssrc == 0x55667788u, "RTP SSRC");
   test_assert(parsed.payload_len == sizeof(payload), "RTP payload length");
 
-  float quiet_tone[FRAME_SAMPLES * 2];
-  float clipped_noise[FRAME_SAMPLES * 2];
-  for (size_t i = 0; i < sizeof(quiet_tone) / sizeof(quiet_tone[0]); i++) {
-    quiet_tone[i] = sinf((float)i * 0.01f) * 0.20f;
-    clipped_noise[i] = (i % 2u) ? 1.0f : -1.0f;
-  }
-  test_assert(!decoded_audio_looks_like_artifact(quiet_tone, sizeof(quiet_tone) / sizeof(quiet_tone[0])), "quiet tone is not artifact-muted");
-  test_assert(decoded_audio_looks_like_artifact(clipped_noise, sizeof(clipped_noise) / sizeof(clipped_noise[0])), "clipped alternating noise is artifact-muted");
+  test_assert(float_to_i16(NAN) == 0, "non-finite PCM converts to silence safely");
 
   PlaybackControlCommand control_command;
   test_assert(parse_playback_control_line("user-volume 1432778632 75", &control_command), "parse user-volume control");
@@ -1553,6 +1514,25 @@ static void run_self_tests(void) {
   test_assert(stats.concealed_packets == 0, "60ms packet no PLC");
   test_assert(stats.opus_60ms_packets == 1, "60ms histogram");
   test_assert(stream.pending.len == 0, "60ms pending drained");
+  stream_destroy(&stream);
+
+  // Loud anti-phase stereo is valid audio and is common in mastered music. A
+  // previous output-statistics heuristic treated interleaved left/right samples
+  // as one waveform, classified this as corruption, and muted the whole frame.
+  uint8_t loud_opus[MAX_PAYLOAD_SIZE];
+  opus_int32 loud_opus_len = 0;
+  encode_test_tone_packet(channels, 1, 0.99f, 440.0f, true, loud_opus, &loud_opus_len);
+  build_rtp_packet(rtp, &rtp_len, DEFAULT_PAYLOAD_TYPE, 88, 0, 100, loud_opus, (size_t)loud_opus_len);
+  test_assert(parse_rtp_packet(rtp, rtp_len, &parsed), "parse loud stereo RTP");
+  memset(&stats, 0, sizeof(stats));
+  test_assert(stream_init(&stream, 100, 88, 0, channels), "init loud stereo stream");
+  test_assert(stream_insert_packet(&stream, &parsed, &stats), "insert loud stereo packet");
+  test_assert(stream_next_frame(&stream, monotonic_ms(), channels, 1000, 10, DEFAULT_MAX_RESYNC_GAP, false, &stats, frame) == STREAM_FRAME_AUDIO, "loud stereo packet yields audio");
+  double loud_sum_sq = 0.0;
+  for (size_t s = 0; s < sizeof(frame) / sizeof(frame[0]); s++) loud_sum_sq += (double)frame[s] * (double)frame[s];
+  double loud_rms = sqrt(loud_sum_sq / (double)(sizeof(frame) / sizeof(frame[0])));
+  test_assert(loud_rms > 0.20, "valid loud stereo is not replaced with silence");
+  test_assert(stats.decoder_resets == 0, "valid loud stereo does not reset decoder");
   stream_destroy(&stream);
 
   memset(&stats, 0, sizeof(stats));
